@@ -1,7 +1,10 @@
-.myenv/
-.venv/
+# Environment secrets
 .env
+.env.*
 **/.env
+**/.env.*
+
+# Python environment
+.myenv/
 __pycache__/
 *.pyc
-.pytest_cache/

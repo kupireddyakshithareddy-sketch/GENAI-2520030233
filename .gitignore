@@ -8,3 +8,17 @@
 .myenv/
 __pycache__/
 *.pyc
+# Virtual environments
+.venv/
+.venv312/
+.myenv/
+**/.venv/
+**/.venv312/
+**/.myenv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Backup files
+.gitignore-backup

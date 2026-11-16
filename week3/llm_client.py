@@ -1,6 +1,7 @@
 
 import os
 import time
+import re
 import requests
 
 from dataclasses import dataclass
@@ -14,8 +15,8 @@ from google.genai import types
 @dataclass
 class LLMResult:
     text: str
-    input_tokens: int
-    output_tokens: int
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 # Abstract Provider
@@ -31,12 +32,18 @@ class GeminiProvider(LLMProvider):
 
     provider_name = "Gemini"
 
-    def __init__(self, api_key, model="gemini-3.7-flash"):
+    def __init__(self, api_key, model="gemini-3.6-flash"):
+
+        if not api_key:
+            raise ValueError("GEMINI_API_KEY is missing!")
+
         self.model = model
 
         self.client = genai.Client(
             api_key=api_key,
-            http_options=types.HttpOptions(timeout=60000)
+            http_options=types.HttpOptions(
+                timeout=120000
+            )
         )
 
     def generate(self, prompt):
@@ -69,6 +76,7 @@ class OllamaProvider(LLMProvider):
     provider_name = "Ollama"
 
     def __init__(self, model="llama3.2"):
+
         self.model = model
         self.url = "http://localhost:11434/api/generate"
 
@@ -81,10 +89,11 @@ class OllamaProvider(LLMProvider):
                 "prompt": prompt,
                 "stream": False
             },
-            timeout=(5, 60)
+            timeout=(5, 120)
         )
 
         response.raise_for_status()
+
         data = response.json()
 
         return LLMResult(
@@ -98,13 +107,63 @@ class OllamaProvider(LLMProvider):
 class LLMClient:
 
     def __init__(self, provider, usage_logger):
+
         self.provider = provider
         self.usage_logger = usage_logger
 
+    # Save usage details
+    def save_usage(self, data):
+
+        try:
+            if self.usage_logger:
+                self.usage_logger.log_call(data)
+
+        except Exception as error:
+            print("MongoDB logging error:", error)
+
+    # Check temporary errors
+    def is_retryable(self, error):
+
+        status = getattr(error, "status_code", None)
+
+        if status is None:
+            status = getattr(error, "code", None)
+
+        message = str(error).lower()
+
+        retry_codes = (408, 429, 500, 502, 503, 504)
+
+        if status in retry_codes:
+            return True
+
+        retry_messages = [
+            "deadline_exceeded",
+            "resource_exhausted",
+            "temporarily unavailable",
+            "service unavailable",
+            "timeout",
+            "connection reset",
+            "connection error",
+            "504",
+            "503",
+            "429"
+        ]
+
+        return any(item in message for item in retry_messages)
+
+    # Generate response
     def generate(self, prompt):
 
         start = time.perf_counter()
         max_attempts = 3
+
+        input_rate = float(os.getenv(
+            "GEMINI_INPUT_PRICE_PER_MILLION", "0"
+        ))
+
+        output_rate = float(os.getenv(
+            "GEMINI_OUTPUT_PRICE_PER_MILLION", "0"
+        ))
 
         for attempt in range(max_attempts):
 
@@ -116,14 +175,7 @@ class LLMClient:
                     (time.perf_counter() - start) * 1000, 2
                 )
 
-                input_rate = float(os.getenv(
-                    "GEMINI_INPUT_PRICE_PER_MILLION", "0"
-                ))
-
-                output_rate = float(os.getenv(
-                    "GEMINI_OUTPUT_PRICE_PER_MILLION", "0"
-                ))
-
+                # Calculate cost
                 if self.provider.provider_name == "Gemini":
 
                     cost = (
@@ -138,8 +190,8 @@ class LLMClient:
                     cost = 0.0
                     cost_type = "local_inference_cost_not_included"
 
-                # Save successful request
-                self.usage_logger.log_call({
+                # Save successful usage
+                usage_data = {
 
                     "provider": self.provider.provider_name,
                     "model": self.provider.model,
@@ -158,48 +210,38 @@ class LLMClient:
                     "status": "success",
                     "attempts": attempt + 1
 
-                })
+                }
 
+                self.save_usage(usage_data)
+
+                # Display successful result
                 print("\nRequest Successful!")
-                print(f"Latency: {latency_ms} ms")
-                print(f"Input tokens: {result.input_tokens}")
-                print(f"Output tokens: {result.output_tokens}")
+
+                print("Latency:", latency_ms, "ms")
+                print("Input tokens:", result.input_tokens)
+                print("Output tokens:", result.output_tokens)
+
                 print(
-                    f"Total tokens: "
-                    f"{result.input_tokens + result.output_tokens}"
+                    "Total tokens:",
+                    result.input_tokens + result.output_tokens
                 )
-                print(f"Estimated cost (USD): {cost}")
+
+                print("Estimated cost (USD):", round(cost, 8))
 
                 return result.text
 
             except Exception as error:
 
-                status = getattr(error, "status_code", None)
-
-                if status is None:
-                    status = getattr(error, "code", None)
-
-                error_name = type(error).__name__.lower()
-
-                retryable = (
-                    isinstance(error, (
-                        requests.exceptions.Timeout,
-                        requests.exceptions.ConnectionError
-                    ))
-                    or status in (408, 429, 500, 502, 503, 504)
-                    or "timeout" in error_name
-                    or "unavailable" in error_name
-                    or "resourceexhausted" in error_name
+                latency_ms = round(
+                    (time.perf_counter() - start) * 1000, 2
                 )
 
-                # Stop for permanent errors or final attempt
+                retryable = self.is_retryable(error)
+
+                # Stop if permanent error or final attempt
                 if not retryable or attempt == max_attempts - 1:
 
-                    latency_ms = round(
-                        (time.perf_counter() - start) * 1000, 2
-                    )
-
-                    self.usage_logger.log_call({
+                    self.save_usage({
 
                         "provider": self.provider.provider_name,
                         "model": self.provider.model,
@@ -220,10 +262,10 @@ class LLMClient:
                     print("\nLLM Request Failed!")
                     print("Error:", error)
 
-                    raise
+                    return None
 
                 # Retry temporary errors
-                delay = 2 ** attempt
+                delay = 2 ** (attempt + 1)
 
                 print(
                     f"Temporary error. Retry "
